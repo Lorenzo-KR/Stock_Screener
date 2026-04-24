@@ -1,0 +1,44 @@
+name: Stock Screener Daily
+
+on:
+  schedule:
+    # 매주 월~금 16:10 KST (07:10 UTC) — 장 마감(15:30) 후 여유 있게
+    - cron: '10 7 * * 1-5'
+  workflow_dispatch:  # 수동 실행 허용
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90       # 전 종목 순회 여유 시간
+
+    permissions:
+      contents: write         # results.json 커밋용
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pykrx anthropic pandas numpy
+
+      - name: Run screener
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/screener.py
+
+      - name: Commit results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/results.json
+          git diff --staged --quiet || \
+            git commit -m "data: screener results $(date +'%Y-%m-%d')"
+          git push
