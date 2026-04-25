@@ -9,12 +9,12 @@ from datetime import datetime, timedelta
 
 from pykrx import stock
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+sys.path.insert(0, os.path.dirname(__file__))
 import db
 
 YEARS       = 3
 PYKRX_SLEEP = 0.05
-FLUSH_SIZE  = 10_000   # Supabase upsert 주기
+FLUSH_SIZE  = 10_000
 
 
 def get_date_range():
@@ -40,9 +40,11 @@ def fetch_ohlcv(ticker: str, start: str, end: str):
 
 
 def main():
-    sb = db.get_client()
+    adapter = db.get_adapter()
+    mode    = "Supabase" if os.environ.get("SUPABASE_URL") else "DuckDB(로컬)"
+    print(f"  DB 모드: {mode}")
 
-    last = db.get_last_ohlcv_date(sb)
+    last = adapter.get_last_ohlcv_date()
     if last:
         print(f"DB에 이미 데이터 있음 (최신: {last}). init_db 건너뜀.")
         print("증분 업데이트는 screener.py가 자동으로 처리합니다.")
@@ -80,14 +82,14 @@ def main():
             ok += 1
 
         if len(buffer) >= FLUSH_SIZE:
-            total_rows += db.upsert_ohlcv(sb, buffer)
+            total_rows += adapter.upsert_ohlcv(buffer)
             buffer.clear()
-            print(f"    → Supabase upsert ({total_rows:,}행 누적)")
+            print(f"    → DB upsert ({total_rows:,}행 누적)")
 
         time.sleep(PYKRX_SLEEP)
 
     if buffer:
-        total_rows += db.upsert_ohlcv(sb, buffer)
+        total_rows += adapter.upsert_ohlcv(buffer)
 
     print(f"  ✓ DB 초기화 완료: {ok:,}종목, {total_rows:,}행 저장")
 

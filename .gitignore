@@ -1,0 +1,7 @@
+data/stock.db
+data/stock.db.wal
+logs/
+__pycache__/
+*.pyc
+.venv/
+.env

@@ -251,16 +251,17 @@ MA5: {ind['ma5']:.0f} | MA20: {ind['ma20']:.0f} | MA60: {ind['ma60']:.0f}
 def main():
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 스크리너 시작")
 
-    # ── Supabase 연결 시도 ────────────────────────────────────────
-    sb      = None
+    # ── DB 어댑터 연결 ────────────────────────────────────────────
+    adapter = None
     use_db  = False
     try:
         import db as _db
-        sb     = _db.get_client()
-        use_db = True
-        print("  Supabase 연결 성공 — DB 모드")
+        adapter = _db.get_adapter()
+        use_db  = True
+        mode = "Supabase(클라우드)" if os.environ.get("SUPABASE_URL") else "DuckDB(로컬)"
+        print(f"  DB 연결 성공 — {mode}")
     except Exception as e:
-        print(f"  Supabase 미사용 — fallback 모드 ({e})")
+        print(f"  DB 미사용 — fallback 모드 ({e})")
 
     # ── 백테스트 통계 로드 ────────────────────────────────────────
     bt_stats = load_backtest_stats()
@@ -276,13 +277,13 @@ def main():
         print(f"  어제({yesterday}) 데이터 배치 수집 중...")
         new_rows = fetch_yesterday_batch(yesterday)
         if new_rows:
-            _db.upsert_ohlcv(sb, new_rows)
-            print(f"  Supabase upsert: {len(new_rows):,}행")
+            adapter.upsert_ohlcv(new_rows)
+            print(f"  DB upsert: {len(new_rows):,}행")
         else:
             print("  어제 데이터 없음 (휴장일 가능성)")
 
         print(f"  DB에서 최근 {DB_OHLCV_DAYS}일 OHLCV 조회 중...")
-        ticker_data = _db.fetch_recent_ohlcv(sb, days=DB_OHLCV_DAYS)
+        ticker_data = adapter.fetch_recent_ohlcv(days=DB_OHLCV_DAYS)
         print(f"  조회 완료: {len(ticker_data):,}개 종목")
         total_scanned = len(ticker_data)
     else:
@@ -381,7 +382,7 @@ def main():
         reverse=True,
     )
 
-    # ── Supabase signals 저장 ────────────────────────────────────
+    # ── DB signals 저장 ──────────────────────────────────────────
     if use_db and candidates:
         today = datetime.today().strftime("%Y-%m-%d")
         signal_rows = [{
@@ -401,8 +402,8 @@ def main():
             "ai_reason"   : c["ai_reason"],
             "ai_risk"     : c["ai_risk"],
         } for c in candidates]
-        _db.upsert_signals(sb, signal_rows)
-        print(f"  Supabase signals 저장: {len(signal_rows)}건")
+        adapter.upsert_signals(signal_rows)
+        print(f"  DB signals 저장: {len(signal_rows)}건")
 
     # ── results.json 저장 ─────────────────────────────────────────
     output = {
