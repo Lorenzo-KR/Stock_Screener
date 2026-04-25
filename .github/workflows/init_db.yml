@@ -1,0 +1,30 @@
+name: DB 초기화 (최초 1회)
+
+on:
+  workflow_dispatch:   # 수동으로만 실행
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # 전 종목 3년치 수집 여유
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pykrx pandas numpy supabase
+
+      - name: Run init_db
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/init_db.py

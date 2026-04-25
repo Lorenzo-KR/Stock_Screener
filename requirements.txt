@@ -2,3 +2,4 @@ pykrx
 anthropic
 pandas
 numpy
+supabase

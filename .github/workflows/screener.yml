@@ -25,16 +25,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install pykrx anthropic pandas numpy
+          pip install pykrx anthropic pandas numpy supabase
 
       - name: Run screener
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python scripts/screener.py
 
       - name: Commit results

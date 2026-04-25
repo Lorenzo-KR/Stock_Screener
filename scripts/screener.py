@@ -1,11 +1,14 @@
 """
 Stock Screener — KOSPI / KOSDAQ
 매일 장 마감 후 GitHub Actions 에서 자동 실행
-출력: data/results.json
+- Supabase 설정 시: 어제 데이터만 증분 수집, DB에서 90일치 조회
+- Supabase 미설정 시: pykrx로 80일치 직접 수집 (fallback)
+출력: data/results.json  +  Supabase signals 테이블
 """
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -13,20 +16,23 @@ import numpy as np
 import pandas as pd
 from pykrx import stock
 
+sys.path.insert(0, os.path.dirname(__file__))
+
 # ─────────────────────────────────────────────────────────────────
 # 설정값
 # ─────────────────────────────────────────────────────────────────
-LOOKBACK_DAYS    = 100     # 수집 기간 (캘린더 일수, 영업일 약 60~70일 확보)
-BREAKOUT_DAYS    = 20      # 박스권 돌파 기준 (N일 신고가)
-VOLUME_MULT      = 2.0     # 거래량 급증 기준 (20일 평균 대비 배수)
-MA_SHORT         = 5
-MA_MID           = 20
-MA_LONG          = 60
-MIN_PRICE        = 1_000   # 동전주 제외 (원)
-MIN_VOLUME       = 50_000  # 거래량 최소 기준
-MAX_AI_TARGETS   = 60      # AI 분석 대상 최대 수 (비용 절감)
-PYKRX_SLEEP      = 0.05    # 종목당 API 딜레이 (초)
-AI_SLEEP         = 1.2     # AI 호출 간 딜레이 (초)
+LOOKBACK_DAYS  = 80       # Supabase 미사용 시 fallback 수집 기간 (캘린더일)
+DB_OHLCV_DAYS  = 90       # Supabase 사용 시 패턴 감지용 조회 기간 (캘린더일)
+BREAKOUT_DAYS  = 20
+VOLUME_MULT    = 2.0
+MA_SHORT       = 5
+MA_MID         = 20
+MA_LONG        = 60
+MIN_PRICE      = 1_000
+MIN_VOLUME     = 50_000
+MAX_AI_TARGETS = 60
+PYKRX_SLEEP    = 0.05
+AI_SLEEP       = 1.2
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -41,11 +47,8 @@ def load_backtest_stats() -> dict:
 
 
 def hist_score_from_stats(patterns: list, stats: dict) -> tuple[int | None, dict | None]:
-    """패턴 조합으로 백테스트 통계 조회 → (hist_score 1~10, stat_dict)"""
     if not stats or not patterns:
         return None, None
-
-    # 가장 구체적인 조합 우선, 없으면 단일 패턴 중 기대수익 최고
     key = "+".join(sorted(patterns))
     s   = stats.get(key)
     if s is None:
@@ -53,52 +56,23 @@ def hist_score_from_stats(patterns: list, stats: dict) -> tuple[int | None, dict
             cand = stats.get(p)
             if cand and (s is None or cand["avg_return_5d"] > s["avg_return_5d"]):
                 s = cand
-
     if s is None:
         return None, None
-
-    # 기대수익(EV) = 승률 × 평균수익 → -2%~+5% 범위를 1~10점으로 선형 매핑
     ev    = s["win_rate_5d"] * s["avg_return_5d"]
     score = max(1, min(10, round(1 + (ev + 2) / 7 * 9)))
     return score, s
 
 
 # ─────────────────────────────────────────────────────────────────
-# 날짜 유틸
+# pykrx 유틸
 # ─────────────────────────────────────────────────────────────────
-def get_date_range():
-    end   = datetime.today()
-    start = end - timedelta(days=LOOKBACK_DAYS)
-    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-
-
-# ─────────────────────────────────────────────────────────────────
-# 데이터 수집
-# ─────────────────────────────────────────────────────────────────
-def get_all_tickers():
-    kospi  = [("KOSPI",  t) for t in stock.get_market_ticker_list(market="KOSPI")]
-    kosdaq = [("KOSDAQ", t) for t in stock.get_market_ticker_list(market="KOSDAQ")]
-    return kospi + kosdaq
-
-
-def get_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame | None:
-    try:
-        df = stock.get_market_ohlcv_by_date(start, end, ticker)
-        if df is None or len(df) < MA_LONG + 5:
-            return None
-        # pykrx 컬럼명 표준화
-        df.columns = [c.strip() for c in df.columns]
-        col_map = {
-            "시가": "open", "고가": "high", "저가": "low",
-            "종가": "close", "거래량": "volume",
-            "거래대금": "amount", "등락률": "change"
-        }
-        df.rename(columns=col_map, inplace=True)
-        df = df[["open", "high", "low", "close", "volume"]].copy()
-        df = df[df["volume"] > 0]
-        return df if len(df) >= MA_LONG + 5 else None
-    except Exception:
-        return None
+def last_trading_day() -> str:
+    """어제 또는 가장 최근 영업일 (yyyymmdd)"""
+    d = datetime.today() - timedelta(days=1)
+    # 주말 보정
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y%m%d")
 
 
 def get_ticker_name(ticker: str) -> str:
@@ -106,6 +80,56 @@ def get_ticker_name(ticker: str) -> str:
         return stock.get_market_ticker_name(ticker)
     except Exception:
         return ticker
+
+
+def get_ohlcv_pykrx(ticker: str, start: str, end: str) -> pd.DataFrame | None:
+    """pykrx에서 단일 종목 OHLCV (fallback용)"""
+    try:
+        df = stock.get_market_ohlcv_by_date(start, end, ticker)
+        if df is None or len(df) < MA_LONG + 5:
+            return None
+        df.columns = [c.strip() for c in df.columns]
+        df.rename(columns={
+            "시가": "open", "고가": "high", "저가": "low",
+            "종가": "close", "거래량": "volume",
+        }, inplace=True)
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        df = df[df["volume"] > 0]
+        return df if len(df) >= MA_LONG + 5 else None
+    except Exception:
+        return None
+
+
+def fetch_yesterday_batch(date_str: str) -> list[dict]:
+    """pykrx 배치 API — 특정 날짜 전 종목 OHLCV (2번 호출로 전 시장 커버)"""
+    rows = []
+    col_map = {
+        "시가": "open", "고가": "high", "저가": "low",
+        "종가": "close", "거래량": "volume",
+    }
+    for market in ("KOSPI", "KOSDAQ"):
+        try:
+            df = stock.get_market_ohlcv_by_ticker(date_str, market=market)
+            if df is None or df.empty:
+                continue
+            df.columns = [c.strip() for c in df.columns]
+            df.rename(columns=col_map, inplace=True)
+            needed = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+            df = df[needed]
+            for ticker, row in df.iterrows():
+                rows.append({
+                    "ticker": str(ticker),
+                    "market": market,
+                    "date":   datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d"),
+                    "open":   int(row.get("open",  0)),
+                    "high":   int(row.get("high",  0)),
+                    "low":    int(row.get("low",   0)),
+                    "close":  int(row.get("close", 0)),
+                    "volume": int(row.get("volume",0)),
+                })
+        except Exception as e:
+            print(f"  배치 fetch 오류 ({market}): {e}")
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -135,7 +159,6 @@ def calc_indicators(df: pd.DataFrame) -> dict:
         "vol_avg20"  : vol_avg20.iloc[-1],
         "high_20d"   : df["high"].iloc[-BREAKOUT_DAYS - 1 : -1].max(),
         "close_20d"  : c.iloc[-20:].tolist(),
-        "vol_20d"    : v.iloc[-20:].tolist(),
     }
 
 
@@ -152,40 +175,26 @@ PATTERN_LABELS = {
 
 def detect_patterns(ind: dict) -> list[str]:
     flags = []
-
-    # 1. 골든크로스: 전일 MA5 < MA20, 당일 MA5 > MA20
     if ind["ma5_prev"] < ind["ma20_prev"] and ind["ma5"] >= ind["ma20"]:
         flags.append("golden_cross")
-
-    # 2. 박스권 돌파: 당일 종가 > 최근 20일(전일까지) 고가
     if not np.isnan(ind["high_20d"]) and ind["close"] > ind["high_20d"]:
         flags.append("breakout")
-
-    # 3. 거래량 급증 + 양봉
-    if (
-        ind["vol_avg20"] > 0
-        and ind["vol_last"] >= ind["vol_avg20"] * VOLUME_MULT
-        and ind["close"] > ind["open_last"]
-    ):
+    if (ind["vol_avg20"] > 0
+            and ind["vol_last"] >= ind["vol_avg20"] * VOLUME_MULT
+            and ind["close"] > ind["open_last"]):
         flags.append("volume_surge")
-
-    # 4. 눌림목: 전일 저가 MA20 ±2% 이내, 당일 종가 MA20 위 회복
-    if (
-        not np.isnan(ind["ma20_prev"])
-        and ind["low_prev"] <= ind["ma20_prev"] * 1.02
-        and ind["close"] > ind["ma20"]
-    ):
+    if (not np.isnan(ind["ma20_prev"])
+            and ind["low_prev"] <= ind["ma20_prev"] * 1.02
+            and ind["close"] > ind["ma20"]):
         flags.append("pullback_support")
-
     return flags
 
 
 # ─────────────────────────────────────────────────────────────────
-# AI 분석 (Claude API)
+# AI 분석
 # ─────────────────────────────────────────────────────────────────
 def score_with_ai(client, name: str, market: str, patterns: list, ind: dict,
                   stat: dict | None = None) -> tuple:
-    """Claude API 로 차트 매력도 1~10 점 + 근거 + 리스크 반환"""
     pattern_str = ", ".join([PATTERN_LABELS.get(p, p) for p in patterns])
     aligned   = (ind["ma5"] > ind["ma20"] > ind["ma60"])
     vol_ratio = (ind["vol_last"] / ind["vol_avg20"]) if ind["vol_avg20"] > 0 else 0
@@ -240,36 +249,76 @@ MA5: {ind['ma5']:.0f} | MA20: {ind['ma20']:.0f} | MA60: {ind['ma60']:.0f}
 # 메인
 # ─────────────────────────────────────────────────────────────────
 def main():
-    start_date, end_date = get_date_range()
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 스크리너 시작 | 기간: {start_date} ~ {end_date}")
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 스크리너 시작")
 
-    tickers = get_all_tickers()
-    print(f"  전체 종목: {len(tickers):,}개")
+    # ── Supabase 연결 시도 ────────────────────────────────────────
+    sb      = None
+    use_db  = False
+    try:
+        import db as _db
+        sb     = _db.get_client()
+        use_db = True
+        print("  Supabase 연결 성공 — DB 모드")
+    except Exception as e:
+        print(f"  Supabase 미사용 — fallback 모드 ({e})")
 
+    # ── 백테스트 통계 로드 ────────────────────────────────────────
+    bt_stats = load_backtest_stats()
+    if bt_stats:
+        print(f"  백테스트 통계: {len(bt_stats)}개 패턴")
+
+    # ── OHLCV 데이터 수집 ─────────────────────────────────────────
+    ticker_data: dict[str, tuple[str, pd.DataFrame]] = {}  # {ticker: (market, df)}
+
+    if use_db:
+        # [DB 모드] 어제 데이터만 pykrx 배치 fetch → upsert → DB에서 90일 조회
+        yesterday = last_trading_day()
+        print(f"  어제({yesterday}) 데이터 배치 수집 중...")
+        new_rows = fetch_yesterday_batch(yesterday)
+        if new_rows:
+            _db.upsert_ohlcv(sb, new_rows)
+            print(f"  Supabase upsert: {len(new_rows):,}행")
+        else:
+            print("  어제 데이터 없음 (휴장일 가능성)")
+
+        print(f"  DB에서 최근 {DB_OHLCV_DAYS}일 OHLCV 조회 중...")
+        ticker_data = _db.fetch_recent_ohlcv(sb, days=DB_OHLCV_DAYS)
+        print(f"  조회 완료: {len(ticker_data):,}개 종목")
+        total_scanned = len(ticker_data)
+    else:
+        # [Fallback 모드] pykrx 개별 종목 fetch
+        end_date   = datetime.today().strftime("%Y%m%d")
+        start_date = (datetime.today() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
+        print(f"  pykrx 개별 수집: {start_date} ~ {end_date}")
+
+        kospi  = [("KOSPI",  t) for t in stock.get_market_ticker_list(market="KOSPI")]
+        kosdaq = [("KOSDAQ", t) for t in stock.get_market_ticker_list(market="KOSDAQ")]
+        all_tickers = kospi + kosdaq
+        total_scanned = len(all_tickers)
+        print(f"  전체 종목: {total_scanned:,}개")
+
+        for i, (market, ticker) in enumerate(all_tickers):
+            if i % 300 == 0:
+                print(f"  진행: {i:,}/{total_scanned:,}")
+            df = get_ohlcv_pykrx(ticker, start_date, end_date)
+            if df is not None:
+                ticker_data[ticker] = (market, df)
+            time.sleep(PYKRX_SLEEP)
+
+    # ── 패턴 감지 ────────────────────────────────────────────────
     candidates = []
-
-    for i, (market, ticker) in enumerate(tickers):
-        if i % 300 == 0:
-            print(f"  진행: {i:,} / {len(tickers):,}")
-
-        df = get_ohlcv(ticker, start_date, end_date)
-        if df is None:
-            time.sleep(PYKRX_SLEEP)
+    for ticker, (market, df) in ticker_data.items():
+        if len(df) < MA_LONG + 5:
             continue
-
         ind = calc_indicators(df)
-
-        # 기본 필터: 최소 가격·거래량
         if ind["close"] < MIN_PRICE or ind["vol_last"] < MIN_VOLUME:
-            time.sleep(PYKRX_SLEEP)
             continue
-
         patterns = detect_patterns(ind)
         if not patterns:
-            time.sleep(PYKRX_SLEEP)
             continue
 
         name = get_ticker_name(ticker)
+        hs, stat = hist_score_from_stats(patterns, bt_stats)
 
         candidates.append({
             "ticker"      : ticker,
@@ -281,31 +330,17 @@ def main():
             "volume_ratio": round(ind["vol_last"] / ind["vol_avg20"], 1) if ind["vol_avg20"] > 0 else 0,
             "ma_aligned"  : bool(ind["ma5"] > ind["ma20"] > ind["ma60"]),
             "close_20d"   : [int(x) for x in ind["close_20d"]],
-            "hist_score"  : None,
-            "hist_win5"   : None,
-            "hist_ret5"   : None,
-            "hist_n"      : None,
+            "hist_score"  : hs,
+            "hist_win5"   : stat["win_rate_5d"]   if stat else None,
+            "hist_ret5"   : stat["avg_return_5d"] if stat else None,
+            "hist_n"      : stat["count"]          if stat else None,
             "ai_score"    : None,
             "ai_reason"   : "",
             "ai_risk"     : "",
+            "_ind"        : ind,   # AI 분석용 임시 필드
         })
-        time.sleep(PYKRX_SLEEP)
 
     print(f"  패턴 감지 후보: {len(candidates)}개")
-
-    # ── 백테스트 점수 부여 ───────────────────────────────────────
-    bt_stats = load_backtest_stats()
-    if bt_stats:
-        print(f"  백테스트 통계 로드 완료 ({len(bt_stats)}개 패턴)")
-        for c in candidates:
-            hs, stat = hist_score_from_stats(c["patterns"], bt_stats)
-            c["hist_score"] = hs
-            if stat:
-                c["hist_win5"] = stat["win_rate_5d"]
-                c["hist_ret5"] = stat["avg_return_5d"]
-                c["hist_n"]    = stat["count"]
-    else:
-        print("  백테스트 통계 없음 — backtest.py를 먼저 실행하세요")
 
     # ── AI 분석 ──────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -314,48 +349,72 @@ def main():
             import anthropic as _anthropic
             client = _anthropic.Anthropic(api_key=api_key)
 
-            # 백테스트 점수 → 패턴 수 → 거래량비율 순 정렬 후 상위만 AI 분석
             candidates.sort(
                 key=lambda x: (x["hist_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
                 reverse=True,
             )
             ai_targets = candidates[:MAX_AI_TARGETS]
-
             print(f"  AI 분석 시작: {len(ai_targets)}개")
+
             for j, c in enumerate(ai_targets):
                 print(f"    [{j+1:02d}/{len(ai_targets)}] {c['name']} ({c['market']})")
-                df = get_ohlcv(c["ticker"], start_date, end_date)
-                if df is not None:
-                    ind = calc_indicators(df)
-                    _, stat = hist_score_from_stats(c["patterns"], bt_stats)
-                    score, reason, risk = score_with_ai(client, c["name"], c["market"], c["patterns"], ind, stat)
-                    c["ai_score"]  = score
-                    c["ai_reason"] = reason
-                    c["ai_risk"]   = risk
+                _, stat = hist_score_from_stats(c["patterns"], bt_stats)
+                score, reason, risk = score_with_ai(
+                    client, c["name"], c["market"], c["patterns"], c["_ind"], stat
+                )
+                c["ai_score"]  = score
+                c["ai_reason"] = reason
+                c["ai_risk"]   = risk
                 time.sleep(AI_SLEEP)
         except ImportError:
             print("  anthropic 패키지 없음 — AI 분석 건너뜀")
     else:
         print("  ANTHROPIC_API_KEY 없음 — AI 분석 건너뜀")
 
-    # ── 최종 정렬: 백테스트 점수 → AI 점수 → 패턴 수 → 거래량비율 ─
+    # _ind 임시 필드 제거
+    for c in candidates:
+        c.pop("_ind", None)
+
+    # ── 최종 정렬 ────────────────────────────────────────────────
     candidates.sort(
         key=lambda x: (x["hist_score"] or 0, x["ai_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
         reverse=True,
     )
 
-    output = {
-        "updated_at"    : datetime.now().strftime("%Y-%m-%d %H:%M KST"),
-        "total_scanned" : len(tickers),
-        "total_found"   : len(candidates),
-        "candidates"    : candidates,
-    }
+    # ── Supabase signals 저장 ────────────────────────────────────
+    if use_db and candidates:
+        today = datetime.today().strftime("%Y-%m-%d")
+        signal_rows = [{
+            "date"        : today,
+            "ticker"      : c["ticker"],
+            "name"        : c["name"],
+            "market"      : c["market"],
+            "patterns"    : c["patterns"],
+            "close"       : c["close"],
+            "change_pct"  : c["change_pct"],
+            "volume_ratio": c["volume_ratio"],
+            "ma_aligned"  : c["ma_aligned"],
+            "hist_score"  : c["hist_score"],
+            "hist_win5"   : c["hist_win5"],
+            "hist_ret5"   : c["hist_ret5"],
+            "ai_score"    : c["ai_score"],
+            "ai_reason"   : c["ai_reason"],
+            "ai_risk"     : c["ai_risk"],
+        } for c in candidates]
+        _db.upsert_signals(sb, signal_rows)
+        print(f"  Supabase signals 저장: {len(signal_rows)}건")
 
+    # ── results.json 저장 ─────────────────────────────────────────
+    output = {
+        "updated_at"   : datetime.now().strftime("%Y-%m-%d %H:%M KST"),
+        "total_scanned": total_scanned,
+        "total_found"  : len(candidates),
+        "candidates"   : candidates,
+    }
     os.makedirs("data", exist_ok=True)
     with open("data/results.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
-
-    print(f"  ✓ 저장 완료: data/results.json ({len(candidates)}개 종목)")
+    print(f"  ✓ data/results.json 저장 ({len(candidates)}개 종목)")
 
 
 if __name__ == "__main__":
