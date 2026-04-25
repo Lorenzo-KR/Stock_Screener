@@ -3,16 +3,39 @@ DB 초기화 — 전 종목 3년치 OHLCV를 Supabase에 적재 (최초 1회 실
 이미 데이터가 있으면 아무것도 하지 않습니다.
 """
 
+import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
 
+import requests
 from pykrx import stock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import db
 
 YEARS       = 3
+
+
+def get_all_tickers(market_code: int) -> list[str]:
+    """네이버 금융에서 종목 코드 목록 조회 (0=KOSPI, 1=KOSDAQ)"""
+    tickers = []
+    for page in range(1, 60):
+        try:
+            r = requests.get(
+                "https://finance.naver.com/sise/sise_market_sum.nhn",
+                params={"sosok": market_code, "page": page},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            codes = re.findall(r"code=([0-9]{6})", r.text)
+            if not codes:
+                break
+            tickers.extend(codes)
+        except Exception:
+            break
+    return list(set(tickers))
 PYKRX_SLEEP = 0.05
 FLUSH_SIZE  = 10_000
 
@@ -53,8 +76,8 @@ def main():
     start_date, end_date = get_date_range()
     print(f"[{datetime.now():%Y-%m-%d %H:%M}] DB 초기화 시작 | {start_date} ~ {end_date}")
 
-    kospi  = [("KOSPI",  t) for t in stock.get_market_ticker_list(market="KOSPI")]
-    kosdaq = [("KOSDAQ", t) for t in stock.get_market_ticker_list(market="KOSDAQ")]
+    kospi  = [("KOSPI",  t) for t in get_all_tickers(0)]
+    kosdaq = [("KOSDAQ", t) for t in get_all_tickers(1)]
     tickers = kospi + kosdaq
     print(f"  전체 종목: {len(tickers):,}개")
 

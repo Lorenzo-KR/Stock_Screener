@@ -12,8 +12,11 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+import re
+
 import numpy as np
 import pandas as pd
+import requests
 from pykrx import stock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,6 +36,26 @@ MIN_VOLUME     = 50_000
 MAX_AI_TARGETS = 60
 PYKRX_SLEEP    = 0.05
 AI_SLEEP       = 1.2
+
+
+def get_all_tickers(market_code: int) -> list[str]:
+    """네이버 금융에서 종목 코드 목록 조회 (0=KOSPI, 1=KOSDAQ)"""
+    tickers = []
+    for page in range(1, 60):
+        try:
+            r = requests.get(
+                "https://finance.naver.com/sise/sise_market_sum.nhn",
+                params={"sosok": market_code, "page": page},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            codes = re.findall(r"code=([0-9]{6})", r.text)
+            if not codes:
+                break
+            tickers.extend(codes)
+        except Exception:
+            break
+    return list(set(tickers))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -292,8 +315,8 @@ def main():
         start_date = (datetime.today() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d")
         print(f"  pykrx 개별 수집: {start_date} ~ {end_date}")
 
-        kospi  = [("KOSPI",  t) for t in stock.get_market_ticker_list(market="KOSPI")]
-        kosdaq = [("KOSDAQ", t) for t in stock.get_market_ticker_list(market="KOSDAQ")]
+        kospi  = [("KOSPI",  t) for t in get_all_tickers(0)]
+        kosdaq = [("KOSDAQ", t) for t in get_all_tickers(1)]
         all_tickers = kospi + kosdaq
         total_scanned = len(all_tickers)
         print(f"  전체 종목: {total_scanned:,}개")
