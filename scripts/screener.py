@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 설정값
 # ─────────────────────────────────────────────────────────────────
 LOOKBACK_DAYS  = 80       # Supabase 미사용 시 fallback 수집 기간 (캘린더일)
-DB_OHLCV_DAYS  = 90       # Supabase 사용 시 패턴 감지용 조회 기간 (캘린더일)
+DB_OHLCV_DAYS  = 130      # DB 패턴 감지용 조회 기간 (캘린더일, 영업일 약 90일 확보)
 BREAKOUT_DAYS  = 20
 VOLUME_MULT    = 2.0
 MA_SHORT       = 5
@@ -100,7 +100,11 @@ def last_trading_day() -> str:
 
 def get_ticker_name(ticker: str) -> str:
     try:
-        return stock.get_market_ticker_name(ticker)
+        name = stock.get_market_ticker_name(ticker)
+        if isinstance(name, str):
+            return name
+        # pykrx 버전에 따라 Series/DataFrame 반환 가능
+        return str(name.iloc[0]) if hasattr(name, "iloc") else str(name)
     except Exception:
         return ticker
 
@@ -130,6 +134,7 @@ def fetch_yesterday_batch(date_str: str) -> list[dict]:
         "시가": "open", "고가": "high", "저가": "low",
         "종가": "close", "거래량": "volume",
     }
+    date_str_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
     for market in ("KOSPI", "KOSDAQ"):
         try:
             df = stock.get_market_ohlcv_by_ticker(date_str, market=market)
@@ -138,20 +143,24 @@ def fetch_yesterday_batch(date_str: str) -> list[dict]:
             df.columns = [c.strip() for c in df.columns]
             df.rename(columns=col_map, inplace=True)
             needed = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+            if not needed:
+                continue
             df = df[needed]
             for ticker, row in df.iterrows():
+                if row.get("close", 0) <= 0 or row.get("volume", 0) <= 0:
+                    continue
                 rows.append({
                     "ticker": str(ticker),
                     "market": market,
-                    "date":   datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d"),
+                    "date":   date_str_fmt,
                     "open":   int(row.get("open",  0)),
                     "high":   int(row.get("high",  0)),
                     "low":    int(row.get("low",   0)),
                     "close":  int(row.get("close", 0)),
                     "volume": int(row.get("volume",0)),
                 })
-        except Exception as e:
-            print(f"  배치 fetch 오류 ({market}): {e}")
+        except Exception:
+            pass  # 배치 실패 시 조용히 넘어감 — 기존 DB 데이터로 스크리닝 계속
     return rows
 
 
