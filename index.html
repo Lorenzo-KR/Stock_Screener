@@ -515,6 +515,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
         <div class="filter-sep"></div>
         <span class="filter-label">정렬</span>
         <select class="sort-select" id="sort-select" onchange="applySort(this.value)">
+          <option value="win_prob_1d">1일 상승확률 순</option>
           <option value="hist_score">백테스트 점수 순</option>
           <option value="ai_score">AI 점수 순</option>
           <option value="pattern_count">패턴 수 순</option>
@@ -575,7 +576,7 @@ let allData      = [];
 let filtered     = [];
 let curMarket    = 'ALL';
 let curPattern   = 'all';
-let curSort      = 'hist_score';
+let curSort      = 'win_prob_1d';
 let curSearch    = '';
 let curPage      = 1;
 const PAGE_SIZE  = 30;
@@ -632,6 +633,8 @@ function applyFilters() {
       r.name.includes(curSearch) || r.ticker.includes(curSearch));
 
   d.sort((a, b) => {
+    if (curSort === 'win_prob_1d')
+      return (b.win_prob_1d||0) - (a.win_prob_1d||0);
     if (curSort === 'hist_score')
       return (b.hist_score||0) - (a.hist_score||0);
     if (curSort === 'ai_score')
@@ -717,6 +720,7 @@ function renderTable() {
       <td class="num">${r.volume_ratio}x</td>
       <td>${maHtml}</td>
       <td><div class="pattern-badges">${badges}</div></td>
+      <td class="ai-score-cell">${buildWinProb(r)}</td>
       <td class="ai-score-cell">${buildHistScore(r)}</td>
       <td class="ai-score-cell">${aiHtml}</td>
       <td class="ai-reason-cell">${buildAiReason(r)}</td>
@@ -734,6 +738,7 @@ function renderTable() {
           <th class="num">거래량비율</th>
           <th>MA 정배열</th>
           <th>감지 패턴</th>
+          <th>1일 상승확률</th>
           <th>백테스트</th>
           <th>AI 점수</th>
           <th>AI 분석 근거</th>
@@ -748,6 +753,20 @@ function renderTable() {
     const canvas = document.getElementById(`spark-${start + idx}`);
     if (canvas && r.close_20d?.length > 1) drawSparkline(canvas, r.close_20d);
   });
+}
+
+function buildWinProb(r) {
+  if (r.win_prob_1d === null || r.win_prob_1d === undefined)
+    return '<span class="ai-na">—</span>';
+  const pct = (r.win_prob_1d * 100).toFixed(0);
+  const ret = r.avg_ret_1d != null ? (r.avg_ret_1d >= 0 ? '+' : '') + r.avg_ret_1d.toFixed(1) + '%' : '';
+  const cls = r.win_prob_1d >= 0.65 ? 'hi' : r.win_prob_1d >= 0.55 ? 'mid' : 'lo';
+  const bar = (r.win_prob_1d * 100).toFixed(0);
+  return `<div class="ai-score ${cls}">
+    <span class="ai-score-num">${pct}%</span>
+    <div class="ai-score-bar-wrap"><div class="ai-score-bar" style="width:${bar}%"></div></div>
+  </div>
+  <div style="font-size:10px;color:var(--text-3);margin-top:3px;">1일 기대 ${ret}</div>`;
 }
 
 function buildHistScore(r) {

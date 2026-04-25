@@ -408,9 +408,33 @@ def main():
     for c in candidates:
         c.pop("_ind", None)
 
-    # ── 최종 정렬 ────────────────────────────────────────────────
+    # ── Analog 분석 (Historical Pattern Matching) ─────────────────
+    try:
+        import analog as _analog
+        print(f"  Analog 분석 시작 ({len(ticker_data):,}개 종목)...")
+        analog_results = _analog.run_analog_screener(ticker_data, top_n=500, adapter=adapter if use_db else None)
+        analog_map = {r["ticker"]: r for r in analog_results}
+
+        for c in candidates:
+            ar = analog_map.get(c["ticker"])
+            c["win_prob_1d"] = ar["win_prob_1d"] if ar else None
+            c["avg_ret_1d"]  = ar["avg_ret_1d"]  if ar else None
+
+        print(f"  Analog 완료: {len(analog_results)}개 점수 산출")
+    except Exception as e:
+        print(f"  Analog 분석 오류: {e}")
+        for c in candidates:
+            c["win_prob_1d"] = None
+            c["avg_ret_1d"]  = None
+
+    # ── 최종 정렬: 1일 상승확률 → 백테스트 점수 → AI 점수 ─────────
     candidates.sort(
-        key=lambda x: (x["hist_score"] or 0, x["ai_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
+        key=lambda x: (
+            x.get("win_prob_1d") or 0,
+            x["hist_score"] or 0,
+            x["ai_score"] or 0,
+            x["volume_ratio"],
+        ),
         reverse=True,
     )
 
