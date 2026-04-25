@@ -38,6 +38,10 @@ PYKRX_SLEEP    = 0.05
 AI_SLEEP       = 1.2
 
 
+_TICKER_NAME_CACHE: dict[str, str] = {}
+_ETF_TICKERS: set[str] = {}
+
+
 def get_all_tickers(market_code: int) -> list[str]:
     """네이버 금융에서 종목 코드 목록 조회 (0=KOSPI, 1=KOSDAQ)"""
     tickers = []
@@ -56,6 +60,64 @@ def get_all_tickers(market_code: int) -> list[str]:
         except Exception:
             break
     return list(set(tickers))
+
+
+def build_name_cache() -> None:
+    """네이버 금융 종목 목록에서 ticker → 종목명 캐시를 미리 구축"""
+    global _TICKER_NAME_CACHE
+    for market_code in (0, 1):
+        for page in range(1, 60):
+            try:
+                r = requests.get(
+                    "https://finance.naver.com/sise/sise_market_sum.nhn",
+                    params={"sosok": market_code, "page": page},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=10,
+                )
+                # 종목 링크 패턴: code=123456 뒤에 클래스 등 속성 있을 수 있으므로 [^>]* 사용
+                pairs = re.findall(r'code=([0-9]{6})[^>]*>([^<]{1,30})</a>', r.text)
+                if not pairs:
+                    break
+                for code, name in pairs:
+                    name = name.strip()
+                    if name and code not in _TICKER_NAME_CACHE:
+                        _TICKER_NAME_CACHE[code] = name
+            except Exception:
+                break
+    print(f"  종목명 캐시 구축: {len(_TICKER_NAME_CACHE):,}개")
+
+
+def build_etf_set() -> None:
+    """네이버 금융 ETF/ETN API에서 전체 코드 세트 구축"""
+    global _ETF_TICKERS
+    codes: set[str] = set()
+    for url, key in [
+        ("https://finance.naver.com/api/sise/etfItemList.nhn", "etfItemList"),
+        ("https://finance.naver.com/api/sise/etnItemList.nhn", "etnItemList"),
+    ]:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            items = r.json()["result"][key]
+            codes.update(item["itemcode"] for item in items)
+        except Exception:
+            pass
+    _ETF_TICKERS = codes
+    print(f"  ETF/ETN 목록 구축: {len(_ETF_TICKERS):,}개")
+
+
+def is_etf(ticker: str, name: str) -> bool:
+    if ticker in _ETF_TICKERS:
+        return True
+    # ETF/ETN 목록 구축 실패 시 이름 기반 판별
+    name_upper = name.upper()
+    if " ETN" in name_upper or " ETF" in name_upper:
+        return True
+    etf_prefixes = (
+        "KODEX", "TIGER", "KBSTAR", "RISE", "HANARO", "ACE", "KOSEF",
+        "ARIRANG", "SOL", "TIMEFOLIO", "KINDEX", "SMART", "TREX", "PLUS",
+        "FOCUS", "MASTER", "TRUE", "QV", "WOORI",
+    )
+    return any(name_upper.startswith(p) for p in etf_prefixes)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -99,14 +161,21 @@ def last_trading_day() -> str:
 
 
 def get_ticker_name(ticker: str) -> str:
+    # 네이버 금융 캐시 우선 사용
+    if ticker in _TICKER_NAME_CACHE:
+        return _TICKER_NAME_CACHE[ticker]
     try:
         name = stock.get_market_ticker_name(ticker)
-        if isinstance(name, str):
+        if isinstance(name, str) and name:
             return name
-        # pykrx 버전에 따라 Series/DataFrame 반환 가능
-        return str(name.iloc[0]) if hasattr(name, "iloc") else str(name)
+        # pykrx 버전에 따라 Series/DataFrame 반환 가능 — 비어있으면 ticker 반환
+        if hasattr(name, "empty") and name.empty:
+            return ticker
+        if hasattr(name, "iloc"):
+            return str(name.iloc[0])
     except Exception:
-        return ticker
+        pass
+    return ticker
 
 
 def get_ohlcv_pykrx(ticker: str, start: str, end: str) -> pd.DataFrame | None:
@@ -295,6 +364,10 @@ def main():
     except Exception as e:
         print(f"  DB 미사용 — fallback 모드 ({e})")
 
+    # ── 종목명 캐시 & ETF 목록 구축 ──────────────────────────────────
+    build_name_cache()
+    build_etf_set()
+
     # ── 백테스트 통계 로드 ────────────────────────────────────────
     bt_stats = load_backtest_stats()
     if bt_stats:
@@ -357,6 +430,7 @@ def main():
             "ticker"      : ticker,
             "name"        : name,
             "market"      : market,
+            "is_etf"      : is_etf(ticker, name),
             "patterns"    : patterns,
             "close"       : int(ind["close"]),
             "change_pct"  : round((ind["close"] / ind["prev_close"] - 1) * 100, 2),
@@ -408,7 +482,7 @@ def main():
     for c in candidates:
         c.pop("_ind", None)
 
-    # ── Analog 분석 (Historical Pattern Matching) ─────────────────
+    # ── Analog 분석 (KNN: 유사 과거 패턴 → 1일 상승 확률) ───────────
     try:
         import analog as _analog
         print(f"  Analog 분석 시작 ({len(ticker_data):,}개 종목)...")
@@ -427,13 +501,39 @@ def main():
             c["win_prob_1d"] = None
             c["avg_ret_1d"]  = None
 
-    # ── 최종 정렬: 1일 상승확률 → 백테스트 점수 → AI 점수 ─────────
+    # ── PreRise 분석 (강한 상승/하락 패턴 KNN → 5일·20일 상승 확률) ─
+    try:
+        import prerise as _prerise
+        print(f"  PreRise 분석 시작...")
+        prerise_results = _prerise.run_prerise_screener(
+            ticker_data, top_n=500, adapter=adapter if use_db else None
+        )
+        prerise_map = {r["ticker"]: r for r in prerise_results}
+
+        for c in candidates:
+            pr = prerise_map.get(c["ticker"])
+            c["win_prob_5d"]  = pr["win_prob_5d"]  if pr else None
+            c["win_prob_20d"] = pr["win_prob_20d"] if pr else None
+            c["avg_ret_5d"]   = pr["avg_ret_5d"]   if pr else None
+            c["avg_ret_20d"]  = pr["avg_ret_20d"]  if pr else None
+
+        print(f"  PreRise 완료: {len(prerise_results)}개 점수 산출")
+    except Exception as e:
+        print(f"  PreRise 분석 오류: {e}")
+        import traceback; traceback.print_exc()
+        for c in candidates:
+            c["win_prob_5d"]  = None
+            c["win_prob_20d"] = None
+            c["avg_ret_5d"]   = None
+            c["avg_ret_20d"]  = None
+
+    # ── 최종 정렬: 5일 상승확률 → 1일 상승확률 → 백테스트 점수 ────
     candidates.sort(
         key=lambda x: (
-            x.get("win_prob_1d") or 0,
+            x.get("win_prob_5d")  or 0,
+            x.get("win_prob_1d")  or 0,
             x["hist_score"] or 0,
-            x["ai_score"] or 0,
-            x["volume_ratio"],
+            x["ai_score"]   or 0,
         ),
         reverse=True,
     )

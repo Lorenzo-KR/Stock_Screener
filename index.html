@@ -442,7 +442,12 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
       <a class="active" onclick="setView('screener')">스크리너</a>
       <a onclick="setView('guide')">패턴 가이드</a>
       <div class="sidebar-divider"></div>
-      <div class="sidebar-section-label">필터</div>
+      <div class="sidebar-section-label">종류</div>
+      <a onclick="applyType('STOCK')">일반 종목</a>
+      <a onclick="applyType('ETF')">ETF</a>
+      <a onclick="applyType('ALL')">전체</a>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-label">시장</div>
       <a onclick="applyMarket('ALL')">전체 시장</a>
       <a onclick="applyMarket('KOSPI')">KOSPI</a>
       <a onclick="applyMarket('KOSDAQ')">KOSDAQ</a>
@@ -497,6 +502,13 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
       <!-- 필터 바 -->
       <div class="filter-bar">
+        <span class="filter-label">종류</span>
+        <div class="filter-group" id="type-filters">
+          <button class="filter-btn active" data-type="STOCK" onclick="applyType('STOCK',this)">일반 종목</button>
+          <button class="filter-btn" data-type="ETF"   onclick="applyType('ETF',this)">ETF</button>
+          <button class="filter-btn" data-type="ALL"   onclick="applyType('ALL',this)">전체</button>
+        </div>
+        <div class="filter-sep"></div>
         <span class="filter-label">시장</span>
         <div class="filter-group" id="market-filters">
           <button class="filter-btn active" data-market="ALL" onclick="applyMarket('ALL',this)">전체</button>
@@ -515,6 +527,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
         <div class="filter-sep"></div>
         <span class="filter-label">정렬</span>
         <select class="sort-select" id="sort-select" onchange="applySort(this.value)">
+          <option value="win_prob_5d" selected>5일 상승확률 순</option>
+          <option value="win_prob_20d">20일 상승확률 순</option>
           <option value="win_prob_1d">1일 상승확률 순</option>
           <option value="hist_score">백테스트 점수 순</option>
           <option value="ai_score">AI 점수 순</option>
@@ -575,8 +589,9 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 let allData      = [];
 let filtered     = [];
 let curMarket    = 'ALL';
+let curType      = 'STOCK';
 let curPattern   = 'all';
-let curSort      = 'win_prob_1d';
+let curSort      = 'win_prob_5d';
 let curSearch    = '';
 let curPage      = 1;
 const PAGE_SIZE  = 30;
@@ -622,6 +637,11 @@ async function loadData() {
 function applyFilters() {
   let d = [...allData];
 
+  if (curType === 'STOCK')
+    d = d.filter(r => !r.is_etf);
+  else if (curType === 'ETF')
+    d = d.filter(r => r.is_etf);
+
   if (curMarket !== 'ALL')
     d = d.filter(r => r.market === curMarket);
 
@@ -633,6 +653,10 @@ function applyFilters() {
       r.name.includes(curSearch) || r.ticker.includes(curSearch));
 
   d.sort((a, b) => {
+    if (curSort === 'win_prob_5d')
+      return (b.win_prob_5d||0) - (a.win_prob_5d||0);
+    if (curSort === 'win_prob_20d')
+      return (b.win_prob_20d||0) - (a.win_prob_20d||0);
     if (curSort === 'win_prob_1d')
       return (b.win_prob_1d||0) - (a.win_prob_1d||0);
     if (curSort === 'hist_score')
@@ -651,6 +675,13 @@ function applyFilters() {
   filtered = d;
   curPage  = 1;
   renderTable();
+}
+
+function applyType(t, el) {
+  curType = t;
+  document.querySelectorAll('[data-type]').forEach(b => b.classList.remove('active'));
+  if (el) el.classList.add('active');
+  applyFilters();
 }
 
 function applyMarket(m, el) {
@@ -720,6 +751,7 @@ function renderTable() {
       <td class="num">${r.volume_ratio}x</td>
       <td>${maHtml}</td>
       <td><div class="pattern-badges">${badges}</div></td>
+      <td class="ai-score-cell">${buildPrerise(r)}</td>
       <td class="ai-score-cell">${buildWinProb(r)}</td>
       <td class="ai-score-cell">${buildHistScore(r)}</td>
       <td class="ai-score-cell">${aiHtml}</td>
@@ -738,7 +770,8 @@ function renderTable() {
           <th class="num">거래량비율</th>
           <th>MA 정배열</th>
           <th>감지 패턴</th>
-          <th>1일 상승확률</th>
+          <th title="과거 큰 움직임 패턴 중 유사한 것들의 5일·20일 상승 비율">5일/20일 상승확률</th>
+          <th title="유사한 과거 패턴에서의 다음날 상승 확률">1일 상승확률</th>
           <th>백테스트</th>
           <th>AI 점수</th>
           <th>AI 분석 근거</th>
@@ -753,6 +786,22 @@ function renderTable() {
     const canvas = document.getElementById(`spark-${start + idx}`);
     if (canvas && r.close_20d?.length > 1) drawSparkline(canvas, r.close_20d);
   });
+}
+
+function buildPrerise(r) {
+  if (r.win_prob_5d === null || r.win_prob_5d === undefined)
+    return '<span class="ai-na">—</span>';
+  const p5  = (r.win_prob_5d  * 100).toFixed(0);
+  const p20 = r.win_prob_20d != null ? (r.win_prob_20d * 100).toFixed(0) : '—';
+  const ret = r.avg_ret_5d != null
+    ? (r.avg_ret_5d >= 0 ? '+' : '') + r.avg_ret_5d.toFixed(1) + '%' : '';
+  const cls = r.win_prob_5d >= 0.65 ? 'hi' : r.win_prob_5d >= 0.55 ? 'mid' : 'lo';
+  const bar = p5;
+  return `<div class="ai-score ${cls}">
+    <span class="ai-score-num">${p5}%</span>
+    <div class="ai-score-bar-wrap"><div class="ai-score-bar" style="width:${bar}%"></div></div>
+  </div>
+  <div style="font-size:10px;color:var(--text-3);margin-top:3px;">20일 ${p20}% · 5일기대 ${ret}</div>`;
 }
 
 function buildWinProb(r) {
