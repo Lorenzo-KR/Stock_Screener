@@ -1,0 +1,45 @@
+name: Backtest Stats Update
+
+on:
+  schedule:
+    # 매월 1일 00:00 UTC (09:00 KST) — 스크리너(07:10 UTC) 실행 전 완료 목표
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360     # 전 종목 3년치 수집 여유 시간
+
+    permissions:
+      contents: write        # backtest_stats.json 커밋용
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pykrx pandas numpy
+
+      - name: Run backtest
+        run: python scripts/backtest.py
+
+      - name: Commit stats
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/backtest_stats.json
+          git diff --staged --quiet || \
+            git commit -m "data: backtest stats $(date +'%Y-%m-%d')"
+          git push

@@ -30,6 +30,40 @@ AI_SLEEP         = 1.2     # AI 호출 간 딜레이 (초)
 
 
 # ─────────────────────────────────────────────────────────────────
+# 백테스트 통계 로드 & 점수 산출
+# ─────────────────────────────────────────────────────────────────
+def load_backtest_stats() -> dict:
+    try:
+        with open("data/backtest_stats.json", "r", encoding="utf-8") as f:
+            return json.load(f).get("pattern_stats", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def hist_score_from_stats(patterns: list, stats: dict) -> tuple[int | None, dict | None]:
+    """패턴 조합으로 백테스트 통계 조회 → (hist_score 1~10, stat_dict)"""
+    if not stats or not patterns:
+        return None, None
+
+    # 가장 구체적인 조합 우선, 없으면 단일 패턴 중 기대수익 최고
+    key = "+".join(sorted(patterns))
+    s   = stats.get(key)
+    if s is None:
+        for p in patterns:
+            cand = stats.get(p)
+            if cand and (s is None or cand["avg_return_5d"] > s["avg_return_5d"]):
+                s = cand
+
+    if s is None:
+        return None, None
+
+    # 기대수익(EV) = 승률 × 평균수익 → -2%~+5% 범위를 1~10점으로 선형 매핑
+    ev    = s["win_rate_5d"] * s["avg_return_5d"]
+    score = max(1, min(10, round(1 + (ev + 2) / 7 * 9)))
+    return score, s
+
+
+# ─────────────────────────────────────────────────────────────────
 # 날짜 유틸
 # ─────────────────────────────────────────────────────────────────
 def get_date_range():
@@ -149,11 +183,20 @@ def detect_patterns(ind: dict) -> list[str]:
 # ─────────────────────────────────────────────────────────────────
 # AI 분석 (Claude API)
 # ─────────────────────────────────────────────────────────────────
-def score_with_ai(client, name: str, market: str, patterns: list, ind: dict) -> tuple:
+def score_with_ai(client, name: str, market: str, patterns: list, ind: dict,
+                  stat: dict | None = None) -> tuple:
     """Claude API 로 차트 매력도 1~10 점 + 근거 + 리스크 반환"""
     pattern_str = ", ".join([PATTERN_LABELS.get(p, p) for p in patterns])
-    aligned = (ind["ma5"] > ind["ma20"] > ind["ma60"])
+    aligned   = (ind["ma5"] > ind["ma20"] > ind["ma60"])
     vol_ratio = (ind["vol_last"] / ind["vol_avg20"]) if ind["vol_avg20"] > 0 else 0
+
+    stat_text = ""
+    if stat:
+        stat_text = f"""
+[백테스트 통계 (최근 3년, n={stat['count']:,}건)]
+5일 승률: {stat['win_rate_5d']:.1%} | 5일 평균수익: {stat['avg_return_5d']:+.1f}%
+20일 승률: {stat['win_rate_20d']:.1%} | 20일 평균수익: {stat['avg_return_20d']:+.1f}%
+"""
 
     prompt = f"""당신은 한국 주식 기술적 분석 전문가입니다. 아래 종목 데이터를 차트 관점에서 분석하세요.
 
@@ -164,13 +207,11 @@ def score_with_ai(client, name: str, market: str, patterns: list, ind: dict) -> 
 MA 정배열: {'YES (MA5 > MA20 > MA60)' if aligned else 'NO'}
 거래량 비율(20일 평균 대비): {vol_ratio:.1f}배
 MA5: {ind['ma5']:.0f} | MA20: {ind['ma20']:.0f} | MA60: {ind['ma60']:.0f}
-최근 20일 종가: {[int(x) for x in ind['close_20d']]}
-
+최근 20일 종가: {[int(x) for x in ind['close_20d']]}{stat_text}
 [평가 기준]
-- 패턴 신뢰도 및 조합 강도
-- MA 정배열 여부와 이격도
-- 거래량 지지 수준
-- 추세 지속 가능성
+- 백테스트 통계 대비 현재 차트 맥락의 신뢰도
+- 패턴 조합 강도 및 MA 정배열 여부
+- 거래량 지지 수준과 추세 지속 가능성
 - 리스크 요소 (고점 근접, 급등 후 과열 등)
 
 반드시 JSON 형식으로만 응답하세요 (다른 텍스트 절대 포함 금지):
@@ -240,6 +281,10 @@ def main():
             "volume_ratio": round(ind["vol_last"] / ind["vol_avg20"], 1) if ind["vol_avg20"] > 0 else 0,
             "ma_aligned"  : bool(ind["ma5"] > ind["ma20"] > ind["ma60"]),
             "close_20d"   : [int(x) for x in ind["close_20d"]],
+            "hist_score"  : None,
+            "hist_win5"   : None,
+            "hist_ret5"   : None,
+            "hist_n"      : None,
             "ai_score"    : None,
             "ai_reason"   : "",
             "ai_risk"     : "",
@@ -248,6 +293,20 @@ def main():
 
     print(f"  패턴 감지 후보: {len(candidates)}개")
 
+    # ── 백테스트 점수 부여 ───────────────────────────────────────
+    bt_stats = load_backtest_stats()
+    if bt_stats:
+        print(f"  백테스트 통계 로드 완료 ({len(bt_stats)}개 패턴)")
+        for c in candidates:
+            hs, stat = hist_score_from_stats(c["patterns"], bt_stats)
+            c["hist_score"] = hs
+            if stat:
+                c["hist_win5"] = stat["win_rate_5d"]
+                c["hist_ret5"] = stat["avg_return_5d"]
+                c["hist_n"]    = stat["count"]
+    else:
+        print("  백테스트 통계 없음 — backtest.py를 먼저 실행하세요")
+
     # ── AI 분석 ──────────────────────────────────────────────────
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key and candidates:
@@ -255,9 +314,9 @@ def main():
             import anthropic as _anthropic
             client = _anthropic.Anthropic(api_key=api_key)
 
-            # 패턴 수 많은 순 → MA정배열 → 거래량비율 순 정렬 후 상위만 AI 분석
+            # 백테스트 점수 → 패턴 수 → 거래량비율 순 정렬 후 상위만 AI 분석
             candidates.sort(
-                key=lambda x: (len(x["patterns"]), x["ma_aligned"], x["volume_ratio"]),
+                key=lambda x: (x["hist_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
                 reverse=True,
             )
             ai_targets = candidates[:MAX_AI_TARGETS]
@@ -268,7 +327,8 @@ def main():
                 df = get_ohlcv(c["ticker"], start_date, end_date)
                 if df is not None:
                     ind = calc_indicators(df)
-                    score, reason, risk = score_with_ai(client, c["name"], c["market"], c["patterns"], ind)
+                    _, stat = hist_score_from_stats(c["patterns"], bt_stats)
+                    score, reason, risk = score_with_ai(client, c["name"], c["market"], c["patterns"], ind, stat)
                     c["ai_score"]  = score
                     c["ai_reason"] = reason
                     c["ai_risk"]   = risk
@@ -278,9 +338,9 @@ def main():
     else:
         print("  ANTHROPIC_API_KEY 없음 — AI 분석 건너뜀")
 
-    # ── 최종 정렬: AI 점수 → 패턴 수 → 거래량비율 ────────────────
+    # ── 최종 정렬: 백테스트 점수 → AI 점수 → 패턴 수 → 거래량비율 ─
     candidates.sort(
-        key=lambda x: (x["ai_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
+        key=lambda x: (x["hist_score"] or 0, x["ai_score"] or 0, len(x["patterns"]), x["volume_ratio"]),
         reverse=True,
     )
 
